@@ -765,3 +765,152 @@ echo ""
 
 log "Complete — ${PD_USERNAME}-${SESSION_HOSTNAME} ($PD_ROLE)"
 exit 0
+
+# =============================================================================
+# STAGE 2b — UDEV HOTPLUG HANDLER (any WiFi adapter, any device)
+# =============================================================================
+section "Stage 2b: WiFi Hotplug Handler"
+
+if ! stage_complete "2b"; then
+
+    # Write the re-detection script that runs on hotplug
+    python3 - <<'PYEOF'
+script = r"""#!/bin/bash
+# PurpleDeck WiFi hotplug handler
+# Triggered by udev on any WiFi interface add/remove
+# Re-detects radios, rewrites mesh.conf, restarts mesh service
+
+PD_LOG="/var/log/pd-hotplug.log"
+PD_STATE="/var/lib/purpledeck"
+PD_CONF="/etc/purpledeck"
+PD_MESH_CONF="$PD_CONF/mesh.conf"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$PD_LOG"; }
+
+log "WiFi hotplug event — ACTION=$ACTION INTERFACE=$INTERFACE"
+
+# Wait briefly for interface to fully register
+sleep 3
+
+# Re-detect all wireless interfaces by driver
+HALOW_IF="" BUILTIN_IF="" DONGLE_AP_IF="" DONGLE_UPLINK_IF=""
+
+for iface in $(ls /sys/class/net/ 2>/dev/null | grep '^wl'); do
+    drv=$(basename "$(readlink /sys/class/net/$iface/device/driver 2>/dev/null)" 2>/dev/null || echo "unknown")
+    log "  $iface -> $drv"
+    case "$drv" in
+        morse*)    HALOW_IF="$iface" ;;
+        brcmfmac*) BUILTIN_IF="$iface" ;;
+        *)
+            # Any unknown USB wireless driver — classify by capability
+            # Check if it supports AP mode
+            if iw phy "$(cat /sys/class/net/$iface/phy80211/name 2>/dev/null)" info 2>/dev/null \
+                | grep -q "AP"; then
+                # Prefer as uplink first, AP second
+                if [ -z "$DONGLE_UPLINK_IF" ]; then
+                    DONGLE_UPLINK_IF="$iface"
+                elif [ -z "$DONGLE_AP_IF" ]; then
+                    DONGLE_AP_IF="$iface"
+                fi
+            fi
+            ;;
+    esac
+done
+
+log "Detected — HaLow:$HALOW_IF Builtin:$BUILTIN_IF Uplink:$DONGLE_UPLINK_IF AP:$DONGLE_AP_IF"
+
+# Assign roles
+if [ -n "$DONGLE_UPLINK_IF" ]; then
+    PD_ROLE="gate"
+    PD_UPLINK_IF="$DONGLE_UPLINK_IF"
+    PD_AP_IF="${DONGLE_AP_IF:-$BUILTIN_IF}"
+    SINGLE_RADIO=0
+else
+    PD_ROLE="point"
+    PD_UPLINK_IF="$BUILTIN_IF"
+    PD_AP_IF="$BUILTIN_IF"
+    SINGLE_RADIO=1
+fi
+PD_MESH_IF="$HALOW_IF"
+
+log "New role: $PD_ROLE | Uplink: $PD_UPLINK_IF | AP: $PD_AP_IF | Mesh: $PD_MESH_IF"
+
+# Read existing passwords — preserve them
+AP_PASS=$(grep '^PD_AP_PASS=' "$PD_MESH_CONF" 2>/dev/null | cut -d= -f2- | tr -d '"' || echo "thatsanicedeck")
+MESH_PASS=$(grep '^PD_MESH_PASS=' "$PD_MESH_CONF" 2>/dev/null | cut -d= -f2- | tr -d '"' || echo "thatsanicedeck")
+MESH_CHANNEL=$(grep '^PD_MESH_CHANNEL=' "$PD_MESH_CONF" 2>/dev/null | cut -d= -f2- | tr -d '"' || echo "36")
+AP_SSID=$(grep '^PD_AP_SSID=' "$PD_MESH_CONF" 2>/dev/null | cut -d= -f2- | tr -d '"' || echo "purpledeck")
+USERNAME=$(grep '^PD_USERNAME=' "$PD_MESH_CONF" 2>/dev/null | cut -d= -f2- | tr -d '"' || echo "")
+HOSTNAME=$(grep '^PD_HOSTNAME=' "$PD_MESH_CONF" 2>/dev/null | cut -d= -f2- | tr -d '"' || hostname)
+
+# Atomic rewrite of mesh.conf
+CONF_TMP="${PD_MESH_CONF}.hotplug.tmp"
+{
+    echo "# PurpleDeck mesh config — hotplug update $(date)"
+    echo "PD_ROLE=\"$PD_ROLE\""
+    echo "PD_AP_IF=\"$PD_AP_IF\""
+    echo "PD_UPLINK_IF=\"$PD_UPLINK_IF\""
+    echo "PD_MESH_IF=\"$PD_MESH_IF\""
+    echo "PD_AP_SSID=\"$AP_SSID\""
+    echo "PD_AP_PASS=\"$AP_PASS\""
+    echo "PD_MESH_PASS=\"$MESH_PASS\""
+    echo "PD_MESH_ID=\"purpledeck\""
+    echo "PD_MESH_CHANNEL=\"$MESH_CHANNEL\""
+    echo "PD_BATMAN_IFACE=\"bat0\""
+    echo "PD_BRIDGE_IFACE=\"br0\""
+    echo "PD_GATEWAY_IP=\"10.41.0.1\""
+    echo "PD_HOSTNAME=\"$HOSTNAME\""
+    echo "PD_USERNAME=\"$USERNAME\""
+} > "$CONF_TMP"
+mv "$CONF_TMP" "$PD_MESH_CONF"
+chmod 600 "$PD_MESH_CONF"
+log "mesh.conf updated"
+
+# Update NM device management
+mkdir -p /etc/NetworkManager/conf.d
+if [ "$SINGLE_RADIO" -eq 1 ]; then
+    printf '[device]\nmatch-device=interface-name:ap0\nmanaged=0\n' \
+        > /etc/NetworkManager/conf.d/purpledeck-devices.conf
+else
+    printf '[device]\nmatch-device=interface-name:%s\nmanaged=0\n' "$PD_AP_IF" \
+        > /etc/NetworkManager/conf.d/purpledeck-devices.conf
+fi
+systemctl reload NetworkManager 2>/dev/null || true
+sleep 1
+
+# Restart mesh with new config
+log "Restarting purpledeck-mesh..."
+systemctl restart purpledeck-mesh 2>/dev/null && \
+    log "purpledeck-mesh restarted OK" || \
+    log "purpledeck-mesh restart failed — check journalctl -u purpledeck-mesh"
+"""
+with open('/usr/local/sbin/pd-hotplug.sh', 'w') as f:
+    f.write(script)
+import os; os.chmod('/usr/local/sbin/pd-hotplug.sh', 0o755)
+print("pd-hotplug.sh written")
+PYEOF
+
+    # Write udev rule — triggers on any wireless interface add/remove
+    # Works with any WiFi adapter on any device
+    python3 - <<'PYEOF'
+rule = """# PurpleDeck WiFi hotplug rule
+# Triggers pd-hotplug.sh on any wireless interface add or remove
+# Works with any WiFi adapter — not hardcoded to specific drivers
+
+SUBSYSTEM=="net", ACTION=="add", KERNEL=="wlan*", \
+    RUN+="/bin/bash -c 'ACTION=add INTERFACE=%k /usr/local/sbin/pd-hotplug.sh > /var/log/pd-hotplug.log 2>&1 &'"
+
+SUBSYSTEM=="net", ACTION=="remove", KERNEL=="wlan*", \
+    RUN+="/bin/bash -c 'ACTION=remove INTERFACE=%k /usr/local/sbin/pd-hotplug.sh > /var/log/pd-hotplug.log 2>&1 &'"
+"""
+with open('/etc/udev/rules.d/99-purpledeck-wifi.rules', 'w') as f:
+    f.write(rule)
+print("99-purpledeck-wifi.rules written")
+PYEOF
+
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger 2>/dev/null || true
+
+    stage_done "2b"
+    ok "Stage 2b done — hotplug handler installed"
+fi
